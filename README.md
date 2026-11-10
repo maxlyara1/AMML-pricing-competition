@@ -1,222 +1,96 @@
-# Динамическое ценообразование в розничной торговле
+# Dynamic Retail Price-Interval Forecasting (`CatBoost` Uncertainty & Quantile Ensemble)
 
-Решение соревнования по предсказанию ценовых интервалов для товаров на основе исторических данных о продажах и контекстных признаков.
+End-to-end competitive ML pipeline predicting daily lower and upper retail price bounds (`[price_p05, price_p95]`) per SKU, evaluated by **Mean 1D Intersection over Union (`IoU`)**.
 
-**Ключевые особенности решения:**
-- Ансамбль из 18 моделей CatBoost (Uncertainty + Quantile)
-- Proxy validation для симуляции условий теста
-- Иерархическая калибровка интервалов с учетом новых/старых товаров
-- Экспоненциальное сглаживание для учета временной зависимости
+- **Private Leaderboard (60% test split)**: **2nd Place** (`Mean 1D IoU = 0.265574`)
+- **Public Leaderboard (40% test split)**: **3rd Place** (`Mean 1D IoU = 0.272687`)
 
-## 📋 Описание задачи
+---
 
-Необходимо предсказать нижнюю (`price_p05`) и верхнюю (`price_p95`) границы ценового диапазона для каждого товара на каждый день тестового периода. Оценка проводится по метрике **mean 1D Intersection over Union (IoU)** между истинными и предсказанными интервалами.
+## 1. Problem Formulation & Evaluation Metric
 
-## 🏗️ Структура проекта
+Given historical daily transaction records and hierarchical product metadata, predict `[price_p05, price_p95]` for every `(product_id, date)` pair in the test horizon, including cold-start SKUs unseen during the recent training window.
 
-```
-.
-├── main.py                 # Основной файл с моделью и пайплайном
-├── requirements.txt        # Зависимости проекта
-├── notebooks/
-│   ├── EDA.ipynb          # Интерактивный анализ данных
-│   └── EDA.md             # Итоговый отчет по EDA
-├── data/
-│   ├── train.csv          # Обучающая выборка
-│   ├── test.csv           # Тестовая выборка
-│   └── sample_submission.csv
-└── results/
-    └── submission.csv      # Финальные предсказания
+Predictions are scored by mean 1D interval `IoU`:
+
+```text
+intersection = max(0, min(y_high, pred_high) - max(y_low, pred_low))
+union        = max(y_high, pred_high) - min(y_low, pred_low)
+IoU          = intersection / union
 ```
 
-## 🔧 Основные компоненты решения
+Because `IoU` penalizes both under-coverage (narrow intervals missing true bounds) and over-coverage (excessively wide intervals inflating `union`), naive symmetric quantile regression degrades sharply under distribution shift and SKU cold start.
 
-### Архитектура модели
+---
 
-Решение использует **ансамбль из 18 моделей CatBoost** (9 моделей × 2 типа):
-
-1. **Модели неопределенности** (`RMSEWithUncertainty`) — предсказывают среднее (μ) и дисперсию (σ²) распределения цен в логарифмической шкале
-2. **Квантильные модели** (`MultiQuantile`) — предсказывают квантили 0.05, 0.5, 0.95 в логарифмической шкале
-
-Оба подхода дополняют друг друга: модели неопределенности дают параметрическую оценку распределения, а квантильные модели — непараметрическую оценку интервалов.
-
-### Пайплайн решения
-
-Ниже схема шагов, чтобы человеку вне проекта было проще понять логику:
-
-- **Новый товар** — `product_id`, которого нет в `train_df` (последние 90 дней).
-- **Proxy new products** — товары с историей, которые специально исключаются из обучения, чтобы валидация имитировала холодный старт.
+## 2. Modeling & Calibration Pipeline (`main.py`)
 
 ```mermaid
 flowchart TD
-    A["Загрузка данных<br/>train.csv, test.csv"] --> B["Подготовка таргетов<br/>среднее/разброс + логарифм"]
-    B --> C["Окно обучения<br/>последние 90 дней"]
-    C --> D["Feature Engineering"]
-    
-    D --> D1["Кластеризация товаров<br/>KMeans k=5"]
-    D --> D2["Target Encoding<br/>KFold для иерархий"]
-    D --> D3["Контекстные признаки<br/>день недели, день месяца,<br/>относительный объем,<br/>взаимодействие активности и кластера"]
-    D --> D4["Детекция аномалий<br/>IsolationForest"]
-    
-    D1 --> E["Proxy validation split"]
-    D2 --> E
-    D3 --> E
-    D4 --> E
-    
-    E --> E1["Proxy new products<br/>240 товаров, стратификация"]
-    E1 --> E2["Train: без последних 30 дней<br/>и без proxy new"]
-    E1 --> E3["Val: последние 30 дней<br/>включая proxy new"]
-    
-    E2 --> F["Обучение ансамбля<br/>9 сидов × 2 типа моделей"]
-    E3 --> F
-    
-    F --> F1["Uncertainty models<br/>RMSEWithUncertainty"]
-    F --> F2["Quantile models<br/>MultiQuantile"]
-    
-    F1 --> F3["Refit на полном train<br/>+15% итераций"]
-    F2 --> F3
-    
-    F3 --> G["Усреднение предсказаний<br/>18 моделей"]
-    G --> H["Подбор весов блендинга<br/>grid search<br/>(с временной калибровкой гамм<br/>для оценки качества)"]
-    H --> H1["Финальный блендинг<br/>mu и sigma<br/>для val и test"]
-    H1 --> I["Детальная калибровка гамм<br/>иерархическая"]
-    
-    I --> I1["Глобальные: новые/старые"]
-    I --> I2["Новые: по management_group_id"]
-    I --> I3["Старые: по cluster + activity"]
-    
-    I1 --> I4{"Подбор коэффициента<br/>неопределенности<br/>(опционально)"}
-    I2 --> I4
-    I3 --> I4
-    
-    I4 --> J["Тюнинг EWM-сглаживания<br/>разные параметры для<br/>старых/новых товаров<br/>(на калиброванных гаммах)"]
-    
-    J --> K["Применение калиброванных гамм<br/>к test (mu_t, sigma_t)"]
-    K --> K1{"Применение EWM-сглаживания<br/>(опционально)"}
-    K1 --> L["Финальные интервалы<br/>price_p05, price_p95"]
-    L --> M["results/submission.csv"]
+    A[Raw Train & Test Panels] --> B[Log-Scale Midpoint & Width Targets + 90-Day Rolling Window]
+    B --> C[Feature Engineering: KMeans Behavioral Clusters, KFold Hierarchical Target Encoding, IsolationForest Anomaly Score, Lag/Calendar Ratios]
+    C --> D[Proxy Validation Split: Last 30 Days + 240 Stratified Cold-Start SKUs]
+    D --> E1[9 x CatBoost RMSEWithUncertainty: Parametric Log-Mean & Log-Variance]
+    D --> E2[9 x CatBoost MultiQuantile: Non-Parametric 0.05 / 0.50 / 0.95 Quantiles]
+    E1 --> F[Grid-Searched Location & Scale Blending]
+    E2 --> F
+    F --> G[Hierarchical Asymmetric Interval Calibration: Global -> Category -> Cluster x Activity]
+    G --> H[Separate Cold/Warm Exponential Moving Average Smoothing]
 ```
 
-### Ключевые особенности
+### Key Technical Components
 
-#### 1. Генерация признаков (`feature_engineering`)
+1. **18-Model Heterogeneous `CatBoost` Ensemble (`9 x RMSEWithUncertainty` + `9 x MultiQuantile`)**:
+   - `RMSEWithUncertainty` (`3,200` trees, `lr = 0.012`, `depth = 7`, `L2 = 15.0`) estimates parametric log-location `mu_unc` and log-variance `sigma_unc^2`.
+   - `MultiQuantile(alpha=0.05,0.50,0.95)` (`3,800` trees, `lr = 0.015`, `depth = 6`, `L2 = 5.0`) captures non-parametric skewness directly.
+   - Ensemble diversity across the 9 members per family is induced via depth offsets (`[-2..+2]`), feature subsampling (`rsm` in `[0.75..1.00]`), and bootstrap temperature schedules.
+2. **Cold-Start Proxy Validation**:
+   - Holds out the final `30` days as a temporal validation window and masks `240` historical SKUs (stratified to match the test `management_group_id` distribution) as synthetic cold-start items so blending weights and interval multipliers reflect unseen-SKU test behavior.
+3. **Parametric + Non-Parametric Blending & Hierarchical Asymmetric Calibration**:
+   - Blends location `mu_blend = w_mu * mu_unc + (1 - w_mu) * q_p50` and scale `sigma_blend = w_sigma * sigma_unc + (1 - w_sigma) * ((q_p95 - q_p05) / 3.29)`.
+   - Fits asymmetric multipliers `(gamma_low, gamma_high)` maximizing `Mean 1D IoU` across a shrinkage hierarchy (`global cold/warm -> management_group_id -> cluster_id -> cluster x activity`), outputting `p05 = expm1(mu_blend - gamma_low * sigma_blend)` and `p95 = expm1(mu_blend + gamma_high * sigma_blend)`.
+4. **Temporal Post-Processing**:
+   - Exploits strong lag-1 autocorrelation (`0.67` on `price_p05`, `0.81` on interval width) via separately tuned Exponential Weighted Moving (`EWM`) smoothing parameters for warm vs. cold-start SKUs, followed by full-data refitting (`+15%` iterations over optimal validation early stopping).
 
-- **Кластеризация товаров** (KMeans, k=5) по агрегированным признакам: средняя цена, разброс цен, частота акций
-- **Target Encoding** с KFold-регуляризацией для всех уровней иерархии категорий
-- **Детекция аномалий** (IsolationForest) для выделения нестандартных товаров
-- **Контекстные признаки**: относительный объем, взаимодействие активности и кластера
+---
 
-#### 2. Валидация (Proxy Validation)
+## 3. Repository Structure
 
-Для оценки качества на трейне используется **proxy validation**, которая симулирует условия теста:
-- Выделение последних 30 дней как валидационного периода
-- Стратифицированный отбор 240 товаров из трейна как "прокси новых товаров" (по распределению `management_group_id` из теста)
-
-#### 3. Блендинг и калибровка
-
-- **Блендинг** предсказаний двух типов моделей:
-  - Объединение μ: `μ_blend = w_mu × μ_unc + (1 - w_mu) × q_p50`
-  - Объединение σ: `σ_blend = w_sigma × σ_unc + (1 - w_sigma) × σ_quantile`, где `σ_quantile = (q_p95 - q_p05) / 3.29` (преобразование квантильного интервала в стандартное отклонение)
-  - Веса `w_mu` и `w_sigma` подбираются через grid search на валидации
-  
-- **Калибровка гамм** (асимметричных множителей для интервалов) с иерархией:
-  - Глобальные гаммы для новых/старых товаров
-  - Групповые гаммы по `management_group_id` (для новых)
-  - Кластерные гаммы по `cluster_id` (для старых)
-  - Специфичные гаммы по кластеру + активности
-  - Финальные интервалы: `p05 = expm1(μ - γ_low × σ)`, `p95 = expm1(μ + γ_high × σ)`
-
-#### 4. Пост-процессинг
-
-- **Экспоненциальное сглаживание** предсказаний по времени (EWM) для учета временной зависимости
-- Разные параметры сглаживания для старых и новых товаров (подбираются через grid search)
-
-### Параметры модели
-
-Основные параметры настраиваются в классе `Config`:
-
-- **Ансамбль**: 9 моделей с разными параметрами (depth, rsm, bootstrap_type, bagging_temperature, subsample)
-- **Окно обучения**: последние 90 дней из трейна (для учета актуальных трендов)
-- **Разнообразие ансамбля**: вариации глубины деревьев (±2 от базовой), sampling-параметров для повышения разнообразия предсказаний
-- **Финальное обучение**: после валидации модели обучаются заново на полных данных с +15% итераций от лучшей итерации
-
-### Использованные методы из курса
-
-Решение использует методы, рассмотренные на лекциях:
-- **Кластеризация** (KMeans) для группировки товаров по паттернам поведения
-- **Детекция аномалий** (IsolationForest) для выделения нестандартных товаров
-- **Снижение размерности** (RobustScaler) при подготовке признаков для кластеризации
-
-## 📊 Анализ данных
-
-Подробный анализ данных представлен в:
-- **`notebooks/EDA.ipynb`** — интерактивный ноутбук с визуализациями и статистиками
-- **`notebooks/EDA.md`** — итоговый отчет с ключевыми выводами
-
-### Основные выводы из EDA и их использование в пайплайне
-
-1. **Новые товары** (150 товаров, 23.6% от теста)
-   - **Проблема**: товары без истории требуют особого подхода
-   - **Решение в пайплайне**:
-     - Proxy validation с симуляцией новых товаров через стратифицированный отбор по `management_group_id`
-     - Отдельная калибровка гамм для новых товаров (глобальные → групповые по `management_group_id`)
-     - Буст гамм для новых товаров (`new_gamma_boost=1.04`) для учета повышенной неопределенности
-     - Разные параметры экспоненциального сглаживания для старых и новых товаров
-
-2. **Временная зависимость** (автокорреляция lag-1: 0.67 для `price_p05`, 0.81 для ширины)
-   - **Проблема**: цены сильно зависят от предыдущих значений
-   - **Решение в пайплайне**:
-     - Экспоненциальное сглаживание предсказаний по времени для каждого товара (`_apply_smoothing`)
-     - Сортировка по `product_id` и `dt` перед применением EWM для корректной временной последовательности
-     - Подбор оптимальных параметров сглаживания (`smoothing_alpha_old`, `smoothing_alpha_new`) через grid search
-
-3. **Эффект акций** (`activity_flag=1` снижает цены на ~14%, увеличивает ширину на ~86%)
-   - **Проблема**: акции существенно меняют поведение цен
-   - **Решение в пайплайне**:
-     - Использование `activity_flag` в кластеризации товаров (агрегация `activity_flag.mean()`)
-     - Признак взаимодействия `act_x_clust = activity_flag * cluster_id`
-     - Детальная калибровка гамм по комбинации кластера и активности (`clusters_act`)
-     - Использование `activity_flag` в детекции аномалий
-
-4. **Динамические категории** (категории меняются по датам для большинства товаров)
-   - **Проблема**: категории не являются фиксированными характеристиками товара
-   - **Решение в пайплайне**:
-     - Target Encoding для всех уровней иерархии (`management_group_id`, `first_category_id`, `second_category_id`, `third_category_id`, `product_id`)
-     - KFold-регуляризация при Target Encoding для предотвращения утечки данных
-     - Байесовское сглаживание с глобальным средним для редких комбинаций
-
-5. **Сдвиг распределений** (тест отличается по погодным признакам и календарным характеристикам)
-   - **Проблема**: распределение признаков в тесте отличается от трейна
-   - **Решение в пайплайне**:
-     - Использование последних 90 дней из трейна (`train_window_days=90`) для обучения на более актуальных данных
-     - Proxy validation с выделением последних 30 дней для симуляции временного сдвига
-     - Стратификация прокси новых товаров по `management_group_id` для учета распределения в тесте
-     - Иерархическая калибровка гамм для адаптации к разным группам товаров
-
-## 🔍 Метрика оценки
-
-**Mean 1D IoU** — среднее пересечение по объединению интервалов:
-
-```
-IoU = intersection / union
-где:
-  intersection = max(0, min(U_true, U_pred) - max(L_true, L_pred))
-  union = w_true + w_pred - intersection
-  w_true = U_true - L_true + ε
-  w_pred = U_pred - L_pred + ε
+```text
+AMML-pricing-competition/
+|-- main.py                     # End-to-end feature, validation, ensemble, calibration & inference pipeline
+|-- notebooks/
+|   |-- EDA.ipynb               # Exploratory autocorrelation, cold-start & seasonality analysis
+|   '-- EDA.md                  # Summary of empirical EDA findings
+|-- data/                       # Competition train/test CSV panels
+|-- results/                    # Generated submission outputs
+|-- Dockerfile                  # Reproducible containerized execution
+'-- requirements.txt            # Pinned Python dependencies
 ```
 
-Чем выше значение, тем лучше (максимум 1.0).
+---
 
-### Воспроизводимость
+## 4. Reproducible Execution
 
-Все случайные процессы фиксируются системным сидом (`system_seed=322`). Для разнообразия ансамбля используются разные сиды, но они также фиксированы в конфигурации.
+### Local Virtual Environment
 
-## 📈 Результаты
+```bash
+git clone https://github.com/maxlyara1/AMML-pricing-competition.git
+cd AMML-pricing-competition
 
-**Финальные результаты соревнования:**
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 
-- **Private Leaderboard**: **2-е место** с score **0.265574** (финальная оценка на 60% тестовых данных)
-- **Public Leaderboard**: **3-е место** с score **0.272687** (оценка на 40% тестовых данных)
+python main.py
+```
 
-Решение показало стабильное качество на обоих лидербордах, что подтверждает корректность подхода к валидации и калибровке модели.
+### Docker
+
+```bash
+docker build -t pricing-interval-solution .
+docker run --rm \
+  -v "$(pwd)/data:/app/data" \
+  -v "$(pwd)/results:/app/results" \
+  pricing-interval-solution
+```
