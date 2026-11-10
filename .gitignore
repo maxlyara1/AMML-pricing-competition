@@ -1,11 +1,10 @@
-# Не забудьте добавить .gitignore если будете использовать Git
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 
 # Virtual environments
+.venv/
 venv/
 venv312/
 env/
@@ -20,20 +19,12 @@ ENV/
 # Jupyter Notebook
 .ipynb_checkpoints/
 
-# Data files (если не хотите коммитить большие файлы)
-# data/train.csv
-# data/test.csv
-
-# Results (submission создается автоматически)
+# Generated outputs
 results/submission.csv
-
-# Docker
-*.tar
-
-# OS
-.DS_Store
-Thumbs.db
-
-
 catboost_info
 EXPERIMENTS.md
+
+# Docker & OS
+*.tar
+.DS_Store
+Thumbs.db

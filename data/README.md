@@ -1,3 +1,3 @@
-# Данные для соревнования
+# Dataset Directory
 
-## Не меняйте здесь файлы
+Contains the competition panel datasets (`train.csv`, `test.csv`, and `sample_submission.csv`) consumed by `main.py`.

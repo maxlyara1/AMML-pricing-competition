@@ -112,10 +112,7 @@ def get_device_type() -> str:
     return "CPU"
 
 def create_submission(predictions: pd.DataFrame | np.ndarray) -> str:
-    """
-    Пропишите здесь создание файла submission.csv в папку results
-    !!! ВНИМАНИЕ !!! ФАЙЛ должен иметь именно такого названия
-    """
+    """Validate prediction columns and write results/submission.csv."""
     cfg = Config()
     if not isinstance(predictions, pd.DataFrame):
         predictions = pd.DataFrame(predictions, columns=["row_id", "price_p05", "price_p95"])

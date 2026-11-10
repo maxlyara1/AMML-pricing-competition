@@ -1,7 +1,3 @@
-# Результаты выполнения
+# Output Directory
 
-Эта папка создается автоматически при запуске `main.py`.
-
-После выполнения программы здесь должен появится файл `submission.csv` с вашими предсказаниями в формате решения на Kaggle.
-
-Преподаватель будет использовать этот файл для расчета вашей метрики качества.
+Generated predictions (`results/submission.csv`) with `row_id`, `price_p05`, and `price_p95` columns are written here by `main.py`.
